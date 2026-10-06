@@ -28,12 +28,12 @@ Before writing code:
 | Include | `#include <lvgl/lvgl.h>` (public API lives in `include/lvgl/`) | `#include "lvgl.h"` |
 | Color config | `LV_COLOR_FORMAT_DEFAULT` (e.g. `LV_COLOR_FORMAT_RGB565`) | `LV_COLOR_DEPTH 16` |
 | Widget flags | `lv_obj_set_hidden(o, true)`, `lv_obj_is_hidden(o)`, `lv_obj_set_clickable`, `lv_obj_set_scrollable` | `lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN)` etc. |
-| Checked/pressed/disabled | `lv_obj_set_checked`, `lv_obj_is_pressed`, `lv_obj_set_disabled`, `lv_obj_set_state(o, st, bool)` | `lv_obj_add_state` / `lv_obj_has_state` |
+| Checked/pressed/disabled | `lv_obj_set_checked` / `lv_obj_is_checked`, `lv_obj_set_pressed` / `lv_obj_is_pressed`, `lv_obj_set_disabled` / `lv_obj_is_disabled`, `lv_obj_set_state(o, st, bool)` | `lv_obj_add_state` / `lv_obj_has_state` (preferred helpers in 9.6, not deprecated) |
 | Subjects | `lv_subject_create(TYPE)` / `lv_subject_delete` (pointer) | `lv_subject_init_int(&s, v)` / `lv_subject_deinit` |
 | Flag/state binding | `lv_obj_bind_bool(o, subj, lv_obj_set_hidden)` | `lv_obj_bind_flag_if_*` |
 | RGB565 byte swap helper | `lv_draw_rgb565_swap` | `lv_draw_sw_rgb565_swap` |
 | Find widget by name | `lv_obj_find_by_name` (needs `LV_USE_OBJ_NAME`) | `lv_obj_find_by_id` |
-| Memory size option | `LV_MEM_SIZE` in **bytes** | `LV_MEM_SIZE_KILOBYTES` removed/renamed |
+| Memory size option | `LV_MEM_SIZE` in **bytes** (e.g. `64 * 1024`) | `LV_MEM_SIZE_KILOBYTES`, `LV_MEM_POOL_EXPAND_SIZE[_KILOBYTES]` |
 
 Details and the full deprecation list: `references/migration.md`.
 
@@ -65,6 +65,8 @@ For deeper material, read the matching reference file:
   `references/ui-patterns.md`
 - FPS, RAM/flash, images, fonts, profiling, dev-vs-production config →
   `references/performance-and-memory.md`
+- Logging, assertions, argument checks, sysmon, profiler, GDB introspection, fuzzing, UI tests →
+  `references/debugging-and-testing.md`
 - Upgrading v8→v9 or v9.5→v9.6 (rename tables, deprecations, v10 prep) →
   `references/migration.md`
 
@@ -91,30 +93,35 @@ For deeper material, read the matching reference file:
 6. **Prefer PARTIAL rendering with DMA double-buffering unless you have RAM for full frames.** Use
    ≥ 1/10 of the screen (1/5 recommended), keep draw buffers in **internal** RAM (LVGL hammers them),
    and flush with DMA so rendering and transfer overlap. With enough RAM, use two screen-sized buffers
-   in `DIRECT` mode and just swap the frame-buffer pointer in `flush_cb`, calling `flush_ready` from
-   the VSYNC interrupt.
+   in `DIRECT` mode: gate the swap on `lv_display_flush_is_last()` (flush is called per area) and use the
+   `flush_wait_cb` / sync / VSYNC callbacks so `flush_ready` is only signalled when the swap is safe.
 7. **Drive the loop from `lv_timer_handler()`'s return value** and sleep that long. If it returns
    `LV_NO_TIMER_READY`, sleep a short fixed time (e.g. `LV_DEF_REFR_PERIOD`) because another thread
    may make a timer ready. If the handler runs in an RTOS task, give that task a generous stack
    (stack overflow looks like random crashes).
 8. **Styles are `static` (or heap-allocated), initialized once, shared across widgets.** Never put an
-   `lv_style_t` on the stack. Use `const` styles for RAM savings when nothing changes at runtime.
+   `lv_style_t` on the stack. `const` applies to prop arrays (e.g. transition `props[]`), not to `lv_style_t` itself.
    Per-widget local styles (`lv_obj_set_style_*`) cost RAM per widget; use them for one-offs only.
-9. **Do not create/delete widgets or change styles inside draw events** (`LV_EVENT_DRAW_*`); LVGL
-   asserts. Do that work in a normal event or timer.
+9. **Do not create/delete widgets or change styles inside draw events** (`LV_EVENT_DRAW_*`); rendering
+   is in progress. LVGL asserts on this, but asserts are **off by default in 9.6** — without
+   `LV_USE_ASSERT` it is silent corruption instead of a clean abort. Do that work in a normal event
+   or timer.
 10. **Delete safely.** Deleting a widget from inside its own event callback → use
     `lv_obj_delete_async()`. Remove or stop anything that outlives the widget and still points at it
     (user-created `lv_timer`s, animations with a custom `var`, raw pointers). Observers added with
-    `lv_subject_add_observer_obj()` and widget bindings clean up automatically.
+    `lv_subject_add_observer_obj()` and widget bindings clean up automatically. To null out a
+    pointer-to-pointer automatically on delete, register it with `lv_obj_null_on_delete(&my_ptr)`.
 11. **Push data to the UI with Subjects/Observers** (`lv_subject_t`, `lv_label_bind_text`, ...) rather
     than polling timers that call `lv_label_set_text` on every tick. Update the UI only when the
     value changed and only when the user would see it.
-12. **Write 9.6-clean code**: dedicated flag/state setters, `lv_subject_create`,
-    `LV_COLOR_FORMAT_DEFAULT`, no `NULL` display argument to `lv_display_*` calls, no private headers
-    from `src/`. It costs nothing now and avoids a v10 rewrite.
-13. **Develop with safety nets, ship without them.** Dev: `LV_USE_LOG`, `LV_USE_ASSERT_*`,
-    `LV_USE_CHECK_ARG` (+ object class/validity checks), sysmon monitors. Production: assertions and
-    the object class/validity checks off (they add overhead), logging reduced.
+12. **Write 9.6-clean code**: dedicated flag/state setters (`lv_obj_set_hidden`, `lv_obj_set_checked`, ...),
+    `lv_subject_create(LV_SUBJECT_TYPE_*)` + `lv_subject_delete`,
+    `LV_COLOR_FORMAT_DEFAULT`, no `NULL` display argument to `lv_display_*` / `lv_sysmon_*` calls, no private headers
+    from `src/`. Generic `lv_obj_add_state` / `has_state` still work — the dedicated setters are just preferred. It costs nothing now and avoids a v10 rewrite.
+    To prove it: build once with `-DLV_DISABLE_API_MAPPING` and every v8/v9 compatibility name becomes a compile error.
+13. **Develop with safety nets, ship without them.** `LV_USE_CHECK_ARG` is **on by default** — keep it on in production; only `LV_USE_CHECK_OBJ_CLASSTYPE` /
+    `LV_USE_CHECK_OBJ_VALIDITY` (which walk the class hierarchy and widget tree on every call) get turned off for release.
+    Dev adds `LV_USE_LOG` + `LV_USE_ASSERT_*` + sysmon. Production reduces logging, keeps `LV_CHECK_ARG_LOG_MODE` at `MINIMAL`.
 14. **Prototype UI in the PC simulator** (SDL via `lv_port_pc_vscode`), then move to hardware.
     Iteration is minutes instead of flash cycles, and layout/style bugs are separated from driver bugs.
 
@@ -131,7 +138,9 @@ For deeper material, read the matching reference file:
 | Works then crashes after screen changes | Dangling pointer to deleted widget, leaked timers/anims | Rule 10; `LV_EVENT_DELETE` cleanup; `lv_screen_load_anim(..., auto_del=true)` |
 | Low FPS | Small/single partial buffer, slow SPI, heavy styles, `-Os` build | See performance reference; measure with sysmon first |
 | Out of memory | `LV_MEM_SIZE` pool exhausted, image cache, many widgets | Create on demand, static label text, const styles, see memory section |
-| PPA/DMA2D crash on ESP32-P4 | Draw buffer not cache-line aligned | `CONFIG_LV_DRAW_BUF_ALIGN=64` |
+| "Check failed:" warnings you never see | `LV_USE_LOG` off, or `LV_CHECK_ARG_LOG_MODE` left at `NONE` (the `lv_conf.h` default) | Enable `LV_USE_LOG`; set `LV_CHECK_ARG_LOG_MODE LV_CHECK_ARG_LOG_MODE_VERBOSE` |
+| Widget calls do nothing, no error | A failed `LV_CHECK_ARG` logs a warning and returns early — it does not fix the call | Read the log line; it names the function and the failing condition |
+| PPA/DMA2D crash on ESP32-P4 | Draw buffer not cache-line aligned | `CONFIG_LV_DRAW_BUF_ALIGN=64` (verify against the installed component; defaults are 4 / stride 1) |
 | Build warnings after upgrading to 9.6 | Deprecated APIs/options | `references/migration.md` |
 
 ## 4. Skeleton (generic port, v9.6 style)
@@ -213,5 +222,7 @@ deserve a quick check against the user's actual headers/docs before being stated
   `include/lvgl/core/lv_obj.h` or run `scripts/migration/migrate_obj_flags.py` from the LVGL repo).
 - Component-specific APIs (esp_lvgl_port config structs, vendor draw units): they change between
   component versions; read the component's README for the installed version.
+- Runtime log deprecations (the `NULL`-display warnings) are only visible with `LV_USE_LOG` on — their
+  absence is not evidence the code is clean. Build with `-DLV_DISABLE_API_MAPPING` to check the names instead.
 
 When unsure, say so and point to the header or doc page rather than guessing a signature.

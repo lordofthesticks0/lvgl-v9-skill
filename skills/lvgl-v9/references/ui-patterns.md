@@ -36,7 +36,7 @@ lv_screen_load_anim(scr, LV_SCREEN_LOAD_ANIM_FADE_IN, 300, 0, true /* auto_del p
 - Input is disabled during the transition animation.
 - Screen events: `LV_EVENT_SCREEN_LOAD_START`, `LV_EVENT_SCREEN_LOADED`, `LV_EVENT_SCREEN_UNLOAD_START`,
   `LV_EVENT_SCREEN_UNLOADED`: use them to start/stop timers and subscriptions that belong to a screen.
-- Each display has `lv_layer_top()` and `lv_layer_sys()` that sit above all screens: use them for toasts,
+- Each display has `lv_layer_top()` and `lv_layer_sys()` (plus `lv_layer_bottom()`) that sit above/below all screens: use them for toasts,
   status bars, popups that must persist across screen changes.
 - Screen size always equals the display; `lv_obj_set_size/pos` do not apply to screens.
 
@@ -55,7 +55,7 @@ lv_obj_set_size(cont, lv_pct(100), LV_SIZE_CONTENT);                   /* percen
   containers on hot screens.
 - Use `pad_row` / `pad_column` styles for gaps.
 
-**Replacements for widgets deprecated in 9.6** (they still compile with a warning, removed in v10):
+**Replacements for widgets deprecated in 9.6** (they still compile via `LV_DEPRECATED`, removed in v10):
 
 ```c
 /* lv_list  ->  flex column of buttons */
@@ -69,8 +69,9 @@ lv_label_set_text(lv_label_create(item), "Item 1");
 
 - `lv_win` → a flex-column `lv_obj` with a header bar and a content area.
 - `lv_menu` → pages built from `lv_obj` plus a back button that swaps which page is visible.
-- `lv_file_explorer` → path header + `lv_table` of entries read via the `lv_fs` API.
-- `lv_spangroup_set_align/mode` and `lv_textarea_set_align` → use the `text_align` style / widget width.
+- File-browser UI (the `lv_file_explorer` widget is deprecated in 9.6, as is the `lv_file_explorer` demo pattern) → path header + `lv_table` of entries read via the `lv_fs` API.
+- `lv_spangroup_set_mode()` **and** `lv_spangroup_set_align()` are deprecated → set the width to `LV_SIZE_CONTENT` / fixed to control wrapping, and use the `text_align` style property for alignment.
+- `lv_textarea_set_align()` is deprecated → same `text_align` style property.
 The LVGL docs ship matching examples (`lv_example_flex_list`, `lv_example_flex_win`,
 `lv_example_menu_navigation`, `lv_example_table_file_browser`).
 
@@ -105,11 +106,11 @@ Rules:
   shared styles; text properties inherit from the parent when no style sets them. Add base styles first,
   state/override styles after.
 - Prefer **shared styles** for anything used by more than one widget. Local styles allocate per widget.
-- **Const styles** save RAM when nothing changes at runtime:
+- **Const styles** save RAM when nothing changes at runtime — as `static const` prop arrays:
   ```c
-  static const lv_style_const_prop_t props[] = { LV_STYLE_CONST_WIDTH(50), LV_STYLE_CONST_HEIGHT(50), LV_STYLE_CONST_PROPS_END };
-  LV_STYLE_CONST_INIT(style_const, props);
+  static const lv_style_prop_t props[] = { LV_STYLE_BG_COLOR, 0 };
   ```
+  (not `const lv_style_t`; a style itself is mutated by `lv_style_init` / `set_*`).
 - Changing a style that is already applied: tell LVGL.
   - simple redraw properties (color, opacity): `lv_obj_invalidate(obj)`
   - size/layout-affecting: `lv_obj_refresh_style(obj, LV_PART_ANY, LV_STYLE_PROP_ANY)`
@@ -155,8 +156,8 @@ lv_obj_add_event_cb(slider, slider_cb, LV_EVENT_VALUE_CHANGED, ctx);
   commonly used ones. 9.6 adds `LV_EVENT_CHECKED/UNCHECKED` and `GESTURE_UP/DOWN/LEFT/RIGHT`.
 - **Bubbling**: with the event-bubble flag on a child, events also go to the parent; the callback's
   current target is the parent, the original target is `lv_event_get_target_obj(e)`. Handy for lists:
-  one callback on the container instead of one per row. (The flag API is deprecated in 9.6; use the
-  dedicated setter named in the 9.6 headers, or `lv_obj_add_flag(..., LV_OBJ_FLAG_EVENT_BUBBLE)` which still
+  one callback on the container instead of one per row. (The flag API is deprecated in 9.6 via `LV_DEPRECATED`; use the
+  dedicated `lv_obj_set_event_bubble()`, or `lv_obj_add_flag(..., LV_OBJ_FLAG_EVENT_BUBBLE)` which still
   compiles with a warning.)
 - **Draw events** (`LV_EVENT_DRAW_MAIN/POST/...`): rendering is in progress. Creating/deleting widgets
   or changing attributes/styles here triggers an assertion. Only issue draw tasks.
@@ -188,9 +189,12 @@ Binding helpers (each is just an Observer and is removed automatically when the 
 | Label text with printf format | `lv_label_bind_text(label, subject, "%d °C")` |
 | Slider / arc / dropdown / roller value (two-way) | `lv_slider_bind_value`, `lv_arc_bind_value`, `lv_dropdown_bind_value`, `lv_roller_bind_value` |
 | Show/hide or any bool flag from 0/non-zero | `lv_obj_bind_bool(obj, subject, lv_obj_set_hidden)` |
-| Checked state (two-way, needs checkable widget) | `lv_obj_bind_checked(obj, subject)` |
+| Checked state (two-way, needs `lv_obj_set_checkable(obj, true)`) | `lv_obj_bind_checked(obj, subject)` |
 | Style active when subject == value | `lv_obj_bind_style(obj, &style, selector, subject, value)` |
+| Any style property from a subject (color, text, number, pointer, string) | `lv_obj_bind_color`, `lv_obj_bind_int`, `lv_obj_bind_float`, `lv_obj_bind_string`, `lv_obj_bind_pointer` |
+| Scale needles from a subject | `lv_scale_bind_line_needle_value`, `lv_scale_bind_image_needle_value` |
 | Anything else (states, comparisons) | `lv_subject_add_observer_obj(subject, cb, widget, NULL)` + `lv_observer_get_target_obj(observer)` |
+| Let a widget *write* a subject (no event handler) | `lv_obj_add_subject_toggle_event(obj, subject, LV_EVENT_CLICKED)`, `lv_obj_add_subject_increment_event(obj, subject, trigger, step)` |
 
 Custom observer:
 
@@ -205,7 +209,10 @@ lv_subject_add_observer_obj(temperature, disabled_cb, widget, NULL);
 
 Notes:
 - `lv_subject_add_observer_obj` observers die with the widget. Plain `lv_subject_add_observer()` ones
-  must be removed with `lv_observer_delete()`.
+  must be removed with `lv_observer_delete()`. `lv_obj_remove_from_subject(widget, subject)` detaches a
+  widget from one subject (or from all of them, with `NULL`).
+- For a non-widget target use `lv_subject_add_observer_with_target()` and read it back with
+  `lv_observer_get_target()`.
 - `lv_subject_delete(subject)` disconnects observers and frees the subject (accepts NULL; pointer is
   invalid afterwards). Subjects alive at `lv_deinit()` are cleaned automatically in 9.6.
 - String subjects: `lv_subject_set_string_buffer_static(s, buf, prev_buf, size)` then `lv_subject_set_string(s, "..")`
@@ -237,16 +244,29 @@ look up the setter name in the 9.6 headers before using it.
 ## 8. Text and fonts
 
 - `lv_label_set_text()` **copies** the string. `lv_label_set_text_static()` stores the pointer: no
-  allocation, but the string must outlive the label (ideal for constants and long-lived buffers).
-  `lv_label_set_text_fmt()` formats printf-style (uses a temporary allocation).
+  allocation, but the string must outlive the label (ideal for long-lived writable buffers).
+  `lv_label_set_text_fmt()` formats printf-style (uses a temporary allocation). `set_text_static` combined
+  with `LONG_MODE_DOTS` edits the buffer in place, so never pass ROM/`const` there.
 - For values refreshed at high rate, only call the setter when the value changed.
 - 9.6: `lv_label_set_max_lines(label, n)` caps line count.
 - Built-in fonts: enable only the Montserrat sizes you use (`LV_FONT_MONTSERRAT_xx`); each enabled font
   costs flash. Set `LV_FONT_DEFAULT`. For other glyph sets/scripts generate a bitmap font with
   `lv_font_conv` (choose only needed ranges, optionally compressed), or use Tiny TTF/FreeType (heavier
   on RAM/CPU; consider caching and PSRAM). 9.6 adds dynamic glyph loading for binary fonts and variable-weight
-  FreeType.
+  FreeType (see the 9.6 changelog/fonts docs for exact APIs).
 - Symbols (`LV_SYMBOL_*`) are font glyphs; make sure the font in use contains them.
+
+### Translations (new in 9.6)
+
+UI strings can live in a translation pack instead of in the code, so a language switch does not mean a
+rebuild. `lv_translation.h` provides `lv_translation_init()`, `lv_translation_add_static()` /
+`lv_translation_add_dynamic()` per language, `lv_translation_set_language()`,
+`lv_translation_get()` to resolve a tag, and `lv_translation_add_tag()` / `lv_translation_set_tag_translation()`
+for the tag indirection. Changing the language fires `LV_EVENT_TRANSLATION_LANGUAGE_CHANGED`; the
+dropdown and roller widgets have direct entry points
+(`lv_dropdown_set_text_translation_tag()`, `lv_dropdown_set_options_translation_tag()`,
+`lv_roller_set_options_translation_tag()`). Because this is a new module, confirm the exact function
+set against `include/lvgl/core/lv_translation.h` in the version you build against.
 
 ## 9. Animations and timers
 
@@ -265,13 +285,12 @@ lv_anim_start(&a);
 ```
 
 - Animations and `lv_timer`s run inside `lv_timer_handler()`; no locking inside their callbacks.
-- Delete animations that target a widget before deleting that widget if they use a custom `var`/callback
-  (cheap and avoids dangling pointers).
+- If the animation `var` is a widget, LVGL deletes its animations automatically with the widget; `lv_anim_delete()` is only needed when `var` is **not** a widget (or for a custom callback holding outside pointers).
 - `lv_anim_count_running()` tells you whether it is safe to let the device sleep.
 - Timelines (`lv_anim_timeline_*`) sequence multiple animations.
 - User timers: `lv_timer_t * t = lv_timer_create(cb, period_ms, user_data); lv_timer_set_repeat_count(t, n); lv_timer_delete(t);`
   Prefer subjects over polling timers for data → UI. `lv_async_call(cb, data)` schedules work on the
-  next handler run (call it from the LVGL thread/with the lock held).
+  next handler run (from another thread still hold the lock, and the `data` pointer must stay valid until the call runs).
 - Budget animations: every animated frame costs a redraw of the affected area; moving/scaling large,
   alpha-blended content is the expensive case.
 
@@ -284,8 +303,21 @@ lv_anim_start(&a);
   static void card_delete_cb(lv_event_t * e) { lv_free(lv_event_get_user_data(e)); }
   lv_obj_add_event_cb(card, card_delete_cb, LV_EVENT_DELETE, ctx);
   ```
-- Never keep a raw `lv_obj_t *` across a screen change without a way to know it is gone (clear it in
-  the delete callback, look it up by name, or check `lv_obj_is_valid()` during development).
+- Never keep a raw `lv_obj_t *` across a screen change without a way to know it is gone. The three
+  options, in order of preference:
+  1. `lv_obj_null_on_delete(&my_ptr)` — new in 9.6. Register the *address of your pointer* and LVGL
+     sets it to `NULL` when the widget dies, so a stale read is `NULL`, not a dangling pointer:
+     ```c
+     static lv_obj_t * card;
+     card = card_create(parent);
+     lv_obj_null_on_delete(&card);
+     ```
+  2. Clear it yourself in an `LV_EVENT_DELETE` callback.
+  3. Look it up again by name (needs `LV_USE_OBJ_NAME`).
+  During development `lv_obj_is_in_widget_tree()` / `LV_USE_CHECK_OBJ_VALIDITY` will tell you a
+  pointer is already dead.
+- Free anything else the widget owns with `lv_obj_add_delete_cb(obj, cb, user_data)` (removed again
+  with `lv_obj_remove_delete_cb(dsc)`) when a one-shot `LV_EVENT_DELETE` callback is not enough.
 - Create-on-demand + delete saves RAM but fragments the pool and costs rebuild time; hiding
   (`lv_obj_set_hidden`) costs RAM but is instant. Choose per screen based on measurements.
 - Enable `LV_USE_CHECK_OBJ_CLASSTYPE` / `LV_USE_CHECK_OBJ_VALIDITY` in dev builds to catch

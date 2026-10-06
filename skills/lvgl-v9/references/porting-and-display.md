@@ -2,7 +2,8 @@
 
 Contents: 1 Init order · 2 Tick · 3 Timer handler and sleeping · 4 Threads and RTOS ·
 5 Display setup (buffers, render modes, flush) · 6 Color format and byte swapping ·
-7 Input devices · 8 Configuration · 9 ESP32 / ESP-IDF · 10 Pipeline picture
+7 Input devices · 8 Configuration · 9 Building and packaging · 10 ESP32 / ESP-IDF ·
+11 Pipeline picture
 
 ---
 
@@ -51,14 +52,15 @@ for(;;) {
 - With `LV_USE_OS` set, `lv_sleep_ms` is the OS sleep; otherwise it is a blocking delay.
 - Low-power pattern: skip `lv_timer_handler()` and sleep the MCU when
   `lv_display_get_inactive_time(lv_display_get_default()) > N` and `lv_anim_count_running() == 0`.
-- 9.6 adds a function to query the time of the next timer if you need finer scheduling.
+- 9.6 adds `uint32_t lv_timer_get_time_to_next(void)` if you need finer scheduling (distinct from the older `lv_timer_get_time_until_next()` / `lv_timer_get_next()`), and two loop shortcuts: `lv_timer_periodic_handler()` runs the super-loop for you (call it as often as you like; it decides when to actually run the handler), and `lv_timer_handler_run_in_period(period_ms)` forces a handler run every `period_ms`.
+- `lv_timer_get_idle()` reports how much idle time was left in the last handler run — useful for spotting a UI that is busy but not visible.
 
 ## 4. Threads and RTOS
 
 **LVGL is not thread-safe.** Do not call any LVGL function while another LVGL call (including
 `lv_timer_handler`) is executing in another thread.
 
-Set `LV_USE_OS` to your OS (`LV_OS_FREERTOS`, `LV_OS_PTHREAD`, `LV_OS_RTTHREAD`, ...) then:
+Set `LV_USE_OS` to your OS (`LV_OS_NONE`, `LV_OS_PTHREAD`, `LV_OS_FREERTOS`, `LV_OS_CMSIS_RTOS2`, `LV_OS_RTTHREAD`, `LV_OS_WINDOWS`, ...) then:
 
 ```c
 void lvgl_task(void * arg) {
@@ -82,15 +84,17 @@ void sensor_task(void * arg) {
 
 - No lock needed inside event/timer/animation callbacks (already inside `lv_timer_handler`).
 - Allowed from any thread without a lock: `lv_tick_inc()`, `lv_display_flush_ready()`.
-- Do **not** call LVGL from an ISR. Post to a queue or set a flag; let the LVGL task apply it.
+- Do **not** call LVGL from an ISR, **except** `lv_tick_inc()` (if a 32-bit write is atomic) and `lv_display_flush_ready()`. Post everything else to a queue or set a flag; let the LVGL task apply it.
 - Hold the lock for a *group* of related calls, not one lock per call, and never block on I/O while
   holding it (the UI freezes).
 - If you run `lv_timer_handler()` in an RTOS task, increase its stack size when you see random
   crashes (this is in LVGL's own FAQ).
 - Alternative design that avoids shared locking: producer tasks write into a queue/atomic and a single
-  LVGL-thread `lv_timer` drains it into subjects.
-- Multiple independent LVGL instances are possible via `LV_GLOBAL_CUSTOM` + thread-local storage
-  (rare; read the Integration overview page first).
+  LVGL-thread `lv_timer` drains it into subjects. `lv_async_call(cb, data)` schedules work for the next
+  handler run — from another thread, still under the lock, and `data` must stay valid until it runs.
+- Multiple independent LVGL instances are possible by supplying your own `lv_global.h` (through
+  `LV_GLOBAL_USE_CUSTOM_INCLUDE` + `LV_GLOBAL_CUSTOM_INCLUDE`, resolved through the `LV_GLOBAL_DEFAULT()`
+  macro) plus thread-local storage. Rare; read the Integration overview page first.
 
 ## 5. Display setup
 
@@ -101,8 +105,11 @@ lv_display_set_buffers(disp, buf1, buf2_or_NULL, size_in_BYTES, render_mode);
 lv_display_set_flush_cb(disp, flush_cb);
 ```
 
-The first display created becomes the default display. v9.6 deprecates passing `NULL` as the
-display to `lv_display_*` functions: use `lv_display_get_default()` explicitly.
+The first display created becomes the default display; `lv_display_set_default()` moves that role to
+another display. v9.6 deprecates passing `NULL` as the display to ~50 `lv_display_*` plus 8
+`lv_sysmon_*` functions: use `lv_display_get_default()` explicitly. Note this one is a **runtime** log
+message (`LV_LOG_DEPRECATED`), not a build warning — you only see it with `LV_USE_LOG` on, and the
+docs only promise it "will be considered an error in future versions".
 
 ### Render modes
 
@@ -137,12 +144,27 @@ void flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * px_map);
 - You **must** eventually call `lv_display_flush_ready(disp)` once per call. This is the single most
   common porting bug. It may be called from the DMA-complete callback or another thread.
 - Optionally set `lv_display_set_flush_wait_cb()` to block on a semaphore instead of LVGL spinning
-  while it waits for the previous flush. The wait callback does not call `flush_ready` itself.
+  while it waits for the previous flush. The wait callback just blocks until the previous transfer is done; it does not call `flush_ready` itself.
 - Keep the flush callback fast and non-blocking; prefer async DMA.
 
-Direct mode with two frame buffers (RGB/MIPI panels): in `flush_cb`, if `lv_display_flush_is_last()`,
-tell the panel to display `px_map`; call `lv_display_flush_ready()` from the VSYNC-done interrupt so
-LVGL does not block while waiting for the buffer swap.
+Direct mode with two frame buffers (RGB/MIPI panels): in `flush_cb`, only act when `lv_display_flush_is_last()`
+tells you it is the final chunk, then tell the panel to display `px_map`; call `lv_display_flush_ready()` from the VSYNC-done interrupt so
+LVGL does not block while waiting for the buffer swap. See also `lv_display_set_sync_cb()` for pre-render sync in 9.6.
+
+### The sync callbacks (new in 9.6)
+
+With two frame buffers in DIRECT/FULL mode LVGL has to keep the buffers in step: it copies newly
+rendered areas into the other buffer after the flush, but first it may need to wait for the panel to
+finish scanning that area out. `lv_display_set_sync_cb(disp, cb)` is called before rendering an area
+and `lv_display_set_sync_wait_cb(disp, cb)` when LVGL has to block until the previous sync finished —
+the pair mirrors flush/flush-wait. The matching display-side helpers are
+`lv_display_sync_ready()` and `lv_display_sync_is_last()`, and the events are `LV_EVENT_SYNC_START` /
+`SYNC_FINISH` / `SYNC_WAIT_START` / `SYNC_WAIT_FINISH`. If you do not set the callbacks, LVGL assumes
+your flush callback handles the swap itself, which is the usual case.
+
+VSYNC plumbing, if your controller exposes it: `lv_display_send_vsync_event()`,
+`lv_display_register_vsync_event()` / `lv_display_unregister_vsync_event()`, plus `LV_EVENT_VSYNC`
+and `LV_EVENT_VSYNC_REQUEST`.
 
 ### Monochrome (I1) panels
 
@@ -156,11 +178,25 @@ LVGL does not block while waiting for the buffer swap.
 
 ### Rotation and resolution
 
-- `lv_display_set_rotation()` rotates in software (LVGL swaps resolutions internally). If the
-  panel/driver can rotate in hardware, prefer that.
-- Resolution changes at runtime: `lv_display_set_resolution()` sends `LV_EVENT_RESOLUTION_CHANGED`.
-- Display events (`lv_display_add_event_cb`): `LV_EVENT_FLUSH_START/FINISH`, `RENDER_START/READY`,
-  `REFR_START/READY`: useful for FPS counters and logic analyzer pins.
+- `lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_90)` does **not** rotate anything: it swaps the
+  horizontal/vertical resolutions internally and emits `LV_EVENT_RESOLUTION_CHANGED` so your driver
+  can reconfigure. Rotating pixels is your job — either in the controller (preferred) or with
+  `lv_draw_rotate(src, dst, w, h, src_stride, dst_stride, rotation, cf)` plus
+  `lv_display_rotate_area(disp, &area)` in the flush callback.
+- Constraint worth knowing: in DIRECT mode the small changed areas are rendered straight into the frame
+  buffer and cannot be rotated afterwards, so only a whole-frame-buffer rotation works there. PARTIAL
+  mode can rotate each chunk. FULL mode works if the buffer you render into differs from the one you
+  rotate into and the render buffer has no stride requirement.
+- Resolution changes at runtime: `lv_display_set_resolution()` (also `lv_display_set_physical_resolution()`
+  and `lv_display_set_dpi()`), each sending `LV_EVENT_RESOLUTION_CHANGED`. Changing the color format at
+  runtime sends `LV_EVENT_COLOR_FORMAT_CHANGED`.
+- Display events (`lv_display_add_event_cb(disp, cb, event, user_data)` returns an `lv_event_dsc_t *`;
+  remove with `lv_display_remove_event(disp, index)` or
+  `lv_display_remove_event_cb_with_user_data(disp, cb, user_data)`): `LV_EVENT_FLUSH_START/FINISH`,
+  `FLUSH_WAIT_START/FINISH`, `RENDER_START/READY`, `REFR_START/READY`, `INVALIDATE_AREA`,
+  `SCREEN_LOAD_START/LOADED`, `VSYNC`: useful for FPS counters and logic analyzer pins.
+  `LV_EVENT_INVALIDATE_AREA` is the one that can *modify* the area (`lv_event_get_param(e)`), which is
+  how you round areas for monochrome panels.
 
 ## 6. Color format and byte swapping
 
@@ -197,8 +233,9 @@ lv_indev_set_read_cb(indev, read_cb);
 - Keypad/encoder navigation needs **groups**: `lv_group_create()`, `lv_group_add_obj()`,
   `lv_indev_set_group()`. Pointer devices do not need groups.
 - Indevs can be bound to a specific display with `lv_indev_set_display()`.
-- Gesture and click timing thresholds are configurable (9.5+ API for gesture thresholds; 9.6 adds a
-  dedicated double-click time and configurable defaults).
+- Gesture and click timing thresholds are configurable in 9.6 (`lv_indev_set_gesture_min_velocity/min_distance`, dedicated `lv_indev_set_double_click_time`, `lv_indev_set_scroll_limit`). The compile-time defaults behind them are now `LV_INDEV_DEF_*` options (`LV_INDEV_DEF_DOUBLE_CLICK_TIME`, `LV_INDEV_DEF_LONG_PRESS_TIME`, `LV_INDEV_DEF_GESTURE_MIN_VELOCITY`, `LV_INDEV_DEF_SCROLL_THROW`, ...), which is the right place to change them if you want one value for the whole app.
+- Physical button indevs report a key id; map it to screen coordinates once with `lv_indev_set_button_points(indev, points)`.
+- Curved / concave panels: `lv_indev_set_ccw()` / `lv_indev_get_ccw()` / `lv_indev_clear_ccw()` describe the panel's curvature so hit testing stays accurate.
 
 ## 8. Configuration
 
@@ -211,15 +248,46 @@ lv_indev_set_read_cb(indev, read_cb);
 - `LV_USE_OS` must match your OS to get `lv_lock/lv_unlock` and the OS-aware sleep.
 - Disable widgets, fonts, libraries you do not use (flash and RAM).
 - Enable `LV_USE_LOG` during bring-up (route to `printf`/ESP_LOG).
-- v9.6 `LV_USE_CHECK_ARG` is on by default: invalid public-API arguments log a warning and the call
-  returns instead of crashing. `LV_USE_ASSERT_*` are off by default; turn them on while debugging.
+- v9.6 `LV_USE_CHECK_ARG` is **on by default** (~2,900 checks); it logs a warning and returns early
+  instead of dereferencing bad arguments. It only *prints* if `LV_USE_LOG` is on **and**
+  `LV_CHECK_ARG_LOG_MODE` is not `NONE` — and `NONE` is the `lv_conf.h` default, so a stock build
+  fails silently. Set `LV_CHECK_ARG_LOG_MODE LV_CHECK_ARG_LOG_MODE_VERBOSE` while bringing a board up.
+  For use-after-delete and wrong-widget-type bugs also enable `LV_USE_CHECK_OBJ_VALIDITY` and
+  `LV_USE_CHECK_OBJ_CLASSTYPE` (both default off) — and turn them back off for release, since they walk
+  the widget tree on every call. `LV_USE_ASSERT_*` are off by default too.
 - Using Kconfig? Function-like macros (`LV_ASSERT_HANDLER`, `LV_ATTRIBUTE_*`, `LV_FONT_CUSTOM_DECLARE`)
-  cannot be Kconfig values; use the per-module `*_USE_CUSTOM_INCLUDE` + `*_CUSTOM_INCLUDE` header.
+  cannot be Kconfig values; use the per-module `*_USE_CUSTOM_INCLUDE` + `*_CUSTOM_INCLUDE` header
+  (`FONT`, `ASSERT`, `ATTRIBUTE`, `SYSMON`, `NEMA`, and the global custom include).
 - Old v9.0 note: keep `lv_conf.h` free of unrelated includes (the migration guide warned that
   `<stdint.h>` there broke assembly-optimized code).
-- Build with warnings visible after upgrading: deprecations are `#warning`s.
+- Build with warnings visible after upgrading: renames are `#warning`s. Add
+  `-DLV_DISABLE_API_MAPPING` for a verification build that turns every compatibility alias into a
+  compile error.
 
-## 9. ESP32 / ESP-IDF
+## 9. Building and packaging (new in 9.6)
+
+9.6 made LVGL behave like an ordinary system library. Worth knowing before you hand-roll a build:
+
+- **Dependencies resolve themselves.** Every dependency (SDL2, FreeType, GStreamer, libdrm, ...) goes
+  through `find_package`, then pkg-config, and anything still missing is fetched and built from source.
+  You no longer install them by hand before configuring.
+- **Installed LVGL is a real library.** `lvgl.pc` and `lvglConfig.cmake` ship with the install and name
+  every library LVGL was compiled against, so `find_package(lvgl)` works from another project.
+- **Presets.** `configs/defconfigs/` has ready-made starting points: `sdl2`, `wayland`, `drm` and
+  `empty` (the minimal one that replaced `LV_CONF_MINIMAL`).
+- **Ubuntu packages.** LVGL is published through a Launchpad PPA, so `apt install` works for host-side
+  development.
+- **Kconfig integration.** `cmake -B build -DLV_BUILD_USE_KCONFIG=ON [-DLV_BUILD_DEFCONFIG_PATH=...]`
+  makes LVGL's CMake read your `.config` / `defconfig`. `LV_BUILD_DEFCONFIG_PATH` also accepts a
+  `;`-separated list, merged left to right, so you can layer `my_overrides.defconfig` on top of a
+  shipped preset.
+- **`lv_conf.defaults`** is the low-friction alternative to a hand-merged `lv_conf.h`: keep one option
+  per line, then run `scripts/generate_lv_conf.py` after each upgrade to regenerate `lv_conf.h` from the
+  current template.
+- Test coverage rose from 78.7% to 82.2% in the 9.6 cycle — a reasonable signal of how well-used a given
+  path is, and worth weighting when you rely on an obscure feature.
+
+## 10. ESP32 / ESP-IDF
 
 ### Recommended integration
 
@@ -229,8 +297,9 @@ touch/encoder/button/USB-HID input, rotation, and runs `lv_timer_handler()` in i
 do not call it yourself:
 
 ```
-idf.py add-dependency "espressif/esp_lvgl_port"      # check the registry for the current version
+idf.py add-dependency "espressif/esp_lvgl_port^2.9.0"   # registry version as of Oct 2026; check for newer
 idf.py add-dependency "espressif/esp_lcd_<panel>"    # e.g. a controller driver from esp-bsp
+idf.py add-dependency "lvgl/lvgl^9.*"                # e.g. "lvgl/lvgl^9.6.0" to pin
 ```
 
 Pin the LVGL version in `idf_component.yml` if you do not want automatic upgrades
@@ -250,9 +319,10 @@ lvgl_port_unlock();
 ```
 
 `lvgl_port_lock(timeout_ms)` is the ESP32 equivalent of `lv_lock()`: use it from `app_main`, sensor
-tasks, Wi-Fi/MQTT callbacks. A newer Espressif component, `esp_lvgl_adapter`, also exists (unified
-display management, tearing control, thread safety, PPA acceleration) — evaluate its README before
-choosing between the two.
+tasks, Wi-Fi/MQTT callbacks. A separate, newer Espressif component, `esp_lvgl_adapter` (0.7.x as of
+Oct 2026; it pulls in `esp_lcd_touch`, `esp_lv_decoder`, `esp_lv_fs`, FreeType, …), is the other
+option — unified display management, tearing control, thread safety and PPA acceleration. Evaluate
+both READMEs against your board before choosing; they are not drop-in replacements for each other.
 
 If you hand-roll the port with esp_lcd: the esp_lcd "color transfer done" callback is the place to
 call `lv_display_flush_ready()` (it runs in ISR context, so do nothing else with LVGL there and keep
@@ -282,10 +352,18 @@ Still keep PARTIAL-mode draw buffers in **internal** RAM when you can; PSRAM is 
 touches the buffers constantly.
 
 ESP32-P4 specifics:
-- Crash with `esp_msync` after enabling PPA → `CONFIG_LV_DRAW_BUF_ALIGN=64` (PPA needs L1 cache-line
-  aligned buffers).
-- Buffer underrun / FPS drops with PSRAM + PPA → `CONFIG_SPIRAM_SPEED_200M=y`; optionally raise
-  `CONFIG_LV_PPA_BURST_LENGTH` (values 8/16/32/64/128; higher can slow other DMA2D users).
+- Enabling the PPA needs **both** `CONFIG_LV_USE_PPA=y` and `CONFIG_LV_DRAW_BUF_ALIGN=64` (PPA only
+  accepts L1-cache-line-aligned data). The usual symptom of forgetting the alignment is an
+  `esp_msync` error on the console. The draw unit then runs alongside the software renderer with no
+  application code.
+- Expected gain: ~30% of rendering time on average for image and rectangle-fill tasks, up to 9× for
+  pure fills on integer multiples of the display size. Image *blending* shows little gain — DMA2D
+  memory bandwidth is the limit — and in PARTIAL mode there is no gain at all, so use it with the
+  port's double-buffer support.
+- Buffer underrun / FPS drops with PSRAM + PPA → `CONFIG_SPIRAM_SPEED_200M=y`.
+  `CONFIG_LV_PPA_BURST_LENGTH` accepts 8/16/32/64/128 and **already defaults to 128** (the maximum);
+  anything else is a build error. Lowering it is what you would try if another DMA2D consumer needs
+  the shared channel.
 
 Logging and files:
 
@@ -295,12 +373,17 @@ CONFIG_LV_LOG_LEVEL_INFO=y
 CONFIG_LV_LOG_PRINTF=y
 ```
 
+Argument checking needs no `CONFIG_` line — it is on by default — but to actually *see* the warnings
+also add `CONFIG_LV_CHECK_ARG_LOG_MODE=y` (Kconfig picks VERBOSE when logging is on) or set
+`CONFIG_LV_CHECK_ARG_LOG_MODE_...` explicitly.
+
 Filesystem images (SPIFFS/LittleFS/SD) work via `LV_USE_FS_STDIO` with a drive letter
 (`CONFIG_LV_FS_STDIO_LETTER=65` for `A:`), then `lv_image_set_src(img, "A:/spiffs/logo.bin")`.
+Setting `CONFIG_LV_FS_DEFAULT_DRIVER_LETTER=65` too lets you drop the prefix in paths.
 Put `CONFIG_` settings in `sdkconfig.defaults` (not just menuconfig) so they are tracked in git;
 `sdkconfig.<chip>` files apply per chip.
 
-## 10. Pipeline picture
+## 11. Pipeline picture
 
 ```
  your tasks / ISRs

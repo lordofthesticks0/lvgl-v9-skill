@@ -19,7 +19,7 @@ npx skills add lordofthesticks0/lvgl-v9-skill -a opencode
 ## What's inside
 
 - `skills/lvgl-v9/SKILL.md` — the skill definition with version facts, workflow, bug triage, and a code skeleton.
-- `skills/lvgl-v9/references/` — deeper material: migration, performance & memory, porting & display, and UI patterns.
+- `skills/lvgl-v9/references/` — deeper material: migration, performance & memory, porting & display, UI patterns, and debugging & testing.
 
 ## License
 
